@@ -1,0 +1,1 @@
+"""Blaze Forward Bot package."""
