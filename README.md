@@ -35,13 +35,19 @@ python run.py
 - `/addchannel <chat_id|@username>` - save a destination channel. Make the selected bot/userbot admin there.
 - `/addbot <BotFather token>` - add another bot identity for forwarding.
 - `/adduserbot <Pyrogram v2 session string>` - add a userbot identity for private sources/live forwarding.
-- `/forward <source> <dest> [start_id] [end_id]` - copy old messages from source to destination.
+- `/forward <source> <dest> [start_id] [end_id]` - copy old messages from source to destination. When the end ID is omitted, the newest source message is used.
 - `/liveforward <source_chat_id> <dest_chat_id>` - forward new messages in real time.
 - `/stop` - cancel the current bulk task.
 - `/stoplive` - clear saved live-forward jobs.
 - `/setcaption <template>` - set media caption template. Placeholders: `{filename}`, `{size}`, `{caption}`.
 - `/setbutton [Text][buttonurl:https://example.com]` - attach a URL button, or call without a valid payload to clear.
-- `/filters` - display current filters.
+- `/settings` or `/filters` - display current settings and filters.
+- `/setmin <MB>`, `/setmax <MB>`, `/keywords <word ...>`, `/blockext <ext ...>` - configure file attribute filters.
+- `/toggle <type>` - enable or disable one message type.
+- `/setregex <include|exclude> <pattern>` and `/replacements <find|replace>` - apply regex and caption/text replacements.
+- `/ongoing` - check whether a bulk task is running.
+- `/unequify <chat> [limit]` - remove duplicate messages from a chat where the forwarding identity has delete permission.
+- `/reset` - reset custom forwarding settings while keeping saved identities and channels.
 
 ## Notes and fixed issues
 
@@ -49,4 +55,5 @@ python run.py
 - Required environment variables fail fast with clear errors.
 - FloodWait is handled by sleeping and retrying the copy.
 - Duplicate media/text detection is stored persistently in `DATA_FILE`.
+- State writes are atomic, so a process interruption will not leave a partially written JSON file.
 - The bot is owner-only, so random Telegram users cannot control forwarding.

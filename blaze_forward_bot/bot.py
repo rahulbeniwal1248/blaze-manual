@@ -23,6 +23,17 @@ BULK_TASKS: dict[int, asyncio.Task[Any]] = {}
 
 TOKEN_RE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b")
 BUTTON_RE = re.compile(r"^\[(?P<text>.+)]\[buttonurl:(?P<url>https?://[^\s\]]+)]$")
+HELP_TEXT = (
+    "🔥 **Blaze Forward Bot**\n\n"
+    "**Forwarding**\n/forward <source> <destination> [start_id] [end_id]\n"
+    "/liveforward <source> <destination> • /stop • /stoplive • /ongoing\n\n"
+    "**Setup**\n/addchannel <chat> • /addbot <token> • /adduserbot <session>\n\n"
+    "**Customize**\n/settings • /setcaption <template> • /setbutton [Text][buttonurl:https://…]\n"
+    "/setmin <MB> • /setmax <MB> • /keywords <word ...> • /blockext <ext ...>\n"
+    "/toggle <text|photo|video|document|audio|voice|animation|sticker|poll>\n"
+    "/setregex <include|exclude> <pattern> • /replacements <find|replace, one per line>\n"
+    "/reset • /unequify <chat> [limit]"
+)
 
 
 def owner_only(_, __, message: Message) -> bool:
@@ -61,10 +72,18 @@ def allowed(message: Message) -> tuple[bool, str]:
     if settings["max_mb"] and size_mb > settings["max_mb"]:
         return False, "above max size"
     low_name = name.lower()
-    if settings["keywords"] and not any(k.lower() in low_name for k in settings["keywords"]):
+    searchable = f"{name}\n{message.text or message.caption or ''}".lower()
+    if settings["keywords"] and not any(k.lower() in searchable for k in settings["keywords"]):
         return False, "keyword mismatch"
     if any(low_name.endswith(f".{ext.lower().lstrip('.')}") for ext in settings["blocked_extensions"]):
         return False, "blocked extension"
+    if settings.get("regex"):
+        try:
+            matched = bool(re.search(settings["regex"], searchable, re.IGNORECASE))
+        except re.error:
+            return False, "invalid regex"
+        if (settings.get("regex_mode") == "include" and not matched) or (settings.get("regex_mode") == "exclude" and matched):
+            return False, "regex filter"
     return True, "ok"
 
 
@@ -81,13 +100,24 @@ def caption_for(message: Message) -> str | None:
     kind, size, name = media_info(message)
     if kind == "text":
         return None
-    original = message.caption or ""
-    return template.format(filename=name, size=f"{size / (1024 * 1024):.2f} MB", caption=original)[:1024]
+    original = apply_replacements(message.caption or "")
+    try:
+        return template.format(filename=name, size=f"{size / (1024 * 1024):.2f} MB", caption=original)[:1024]
+    except (KeyError, ValueError):
+        return original[:1024]
+
+
+def apply_replacements(value: str) -> str:
+    for find, replacement in STORE.data["settings"].get("replacements", []):
+        value = value.replace(find, replacement)
+    return value
 
 
 async def copy_with_retry(client: Client, message: Message, dest: int | str) -> Message:
     while True:
         try:
+            if media_info(message)[0] == "text":
+                return await client.send_message(dest, apply_replacements(message.text or ""), reply_markup=reply_markup())
             return await message.copy(dest, caption=caption_for(message), reply_markup=reply_markup())
         except FloodWait as exc:
             await asyncio.sleep(exc.value)
@@ -102,13 +132,15 @@ def parse_chat(value: str) -> int | str:
 
 @APP.on_message(filters.command("start") & OWNER)
 async def start(_: Client, message: Message) -> None:
-    await message.reply(
-        "🔥 Blaze Forward Bot ready.\n\n"
-        "Commands:\n"
-        "/addchannel <chat_id|@username>\n/addbot <BotFather token>\n/adduserbot <Pyrogram session string>\n"
-        "/forward <source> <dest> [start_id] [end_id]\n/liveforward <source> <dest>\n/stop /stoplive\n"
-        "/setcaption <template> /setbutton [Text][buttonurl:https://...]\n/filters"
-    )
+    await message.reply(HELP_TEXT)
+
+
+@APP.on_message(filters.command(["help", "about"]) & OWNER)
+async def help_command(_: Client, message: Message) -> None:
+    if message.command[0] == "help":
+        await message.reply(HELP_TEXT)
+    else:
+        await message.reply("Blaze Forward Bot v1.1 — owner-controlled, filtered forwarding.")
 
 
 @APP.on_message(filters.command("addchannel") & OWNER)
@@ -169,36 +201,53 @@ async def best_client() -> Client:
     return APP
 
 
+async def best_user_client() -> Client | None:
+    for name, item in STORE.data["forwarders"].items():
+        if item["type"] != "user":
+            continue
+        if name not in LIVE_CLIENTS:
+            client = Client(name, api_id=CONFIG.api_id, api_hash=CONFIG.api_hash, session_string=item["session"], workdir=str(CONFIG.session_dir))
+            await client.start()
+            LIVE_CLIENTS[name] = client
+        return LIVE_CLIENTS[name]
+    return None
+
+
 async def run_bulk(message: Message, source: int | str, dest: int | str, start_id: int, end_id: int) -> None:
     client = await best_client()
     status = await message.reply("⏳ Forwarding started...")
     stats = {"fetched": 0, "sent": 0, "dupe": 0, "filtered": 0, "deleted": 0}
     seen = set(STORE.data["duplicates"])
     started = monotonic()
-    for msg_id in range(start_id, end_id + 1):
-        if message.from_user.id in BULK_TASKS and BULK_TASKS[message.from_user.id].cancelled():
-            break
-        with suppress(RPCError):
-            msg = await client.get_messages(source, msg_id)
-            stats["fetched"] += 1
-            if not msg or msg.empty:
-                stats["deleted"] += 1
-                continue
-            ok, _ = allowed(msg)
-            fp = fingerprint(msg)
-            if fp in seen:
-                stats["dupe"] += 1
-                continue
-            if not ok:
-                stats["filtered"] += 1
-                continue
-            await copy_with_retry(client, msg, dest)
-            seen.add(fp)
-            stats["sent"] += 1
-        if stats["fetched"] % CONFIG.status_update_every == 0:
-            await status.edit(f"📊 {stats}\n⏱ {int(monotonic() - started)}s")
-    STORE.data["duplicates"] = list(seen)[-50000:]
-    STORE.save()
+    try:
+        for msg_id in range(start_id, end_id + 1):
+            with suppress(RPCError):
+                msg = await client.get_messages(source, msg_id)
+                stats["fetched"] += 1
+                if not msg or msg.empty:
+                    stats["deleted"] += 1
+                    continue
+                ok, _ = allowed(msg)
+                fp = fingerprint(msg)
+                if STORE.data["settings"].get("skip_duplicates", True) and fp in seen:
+                    stats["dupe"] += 1
+                    continue
+                if not ok:
+                    stats["filtered"] += 1
+                    continue
+                await copy_with_retry(client, msg, dest)
+                seen.add(fp)
+                stats["sent"] += 1
+            if stats["fetched"] % CONFIG.status_update_every == 0:
+                await status.edit(f"📊 {stats}\n⏱ {int(monotonic() - started)}s")
+    except asyncio.CancelledError:
+        await status.edit(f"🛑 Stopped\n📊 {stats}")
+        raise
+    finally:
+        STORE.data["duplicates"] = list(seen)[-50000:]
+        STORE.save()
+        if message.from_user:
+            BULK_TASKS.pop(message.from_user.id, None)
     await status.edit(f"✅ Done\n📊 {stats}")
 
 
@@ -208,9 +257,24 @@ async def forward(_: Client, message: Message) -> None:
         await message.reply("Usage: /forward <source_chat_id|@username> <dest_chat_id|@username> [start_id=1] [end_id=last]")
         return
     client = await best_client()
-    source, dest = parse_chat(message.command[1]), parse_chat(message.command[2])
-    start_id = int(message.command[3]) if len(message.command) > 3 else 1
-    end_id = int(message.command[4]) if len(message.command) > 4 else (await client.get_chat(source)).last_message_id
+    try:
+        source, dest = parse_chat(message.command[1]), parse_chat(message.command[2])
+        start_id = int(message.command[3]) if len(message.command) > 3 else 1
+        if len(message.command) > 4:
+            end_id = int(message.command[4])
+        else:
+            newest = await anext(client.get_chat_history(source, limit=1), None)
+            end_id = newest.id if newest else 0
+    except (RPCError, ValueError) as exc:
+        await message.reply(f"Cannot start forwarding: {exc}")
+        return
+    if start_id < 1 or end_id < start_id:
+        await message.reply("No messages found in that range.")
+        return
+    existing = BULK_TASKS.get(message.from_user.id)
+    if existing and not existing.done():
+        await message.reply("A bulk task is already running. Use /stop first.")
+        return
     task = asyncio.create_task(run_bulk(message, source, dest, start_id, end_id))
     BULK_TASKS[message.from_user.id] = task
 
@@ -252,6 +316,136 @@ async def show_filters(_: Client, message: Message) -> None:
     await message.reply(f"Current settings:\n`{STORE.data['settings']}`")
 
 
+@APP.on_message(filters.command("settings") & OWNER)
+async def settings(_: Client, message: Message) -> None:
+    settings_data = STORE.data["settings"]
+    enabled = ", ".join(kind.removeprefix("allow_") for kind, value in settings_data.items() if kind.startswith("allow_") and value)
+    await message.reply(
+        f"⚙️ **Settings**\nEnabled types: {enabled}\n"
+        f"Size: {settings_data['min_mb']}–{settings_data['max_mb'] or '∞'} MB\n"
+        f"Keywords: {', '.join(settings_data['keywords']) or 'none'}\n"
+        f"Blocked extensions: {', '.join(settings_data['blocked_extensions']) or 'none'}\n"
+        f"Duplicate skipping: {'on' if settings_data['skip_duplicates'] else 'off'}\n"
+        f"Regex: {settings_data['regex'] or 'off'} ({settings_data['regex_mode']})\n\n"
+        "Use /help for configuration commands."
+    )
+
+
+def command_value(message: Message) -> str:
+    return (message.text or "").partition(" ")[2].strip()
+
+
+@APP.on_message(filters.command(["setmin", "setmax"]) & OWNER)
+async def set_size(_: Client, message: Message) -> None:
+    try:
+        value = float(command_value(message))
+        if value < 0:
+            raise ValueError
+    except ValueError:
+        await message.reply(f"Usage: /{message.command[0]} <non-negative MB>")
+        return
+    key = "min_mb" if message.command[0] == "setmin" else "max_mb"
+    proposed_min = value if key == "min_mb" else STORE.data["settings"]["min_mb"]
+    proposed_max = value if key == "max_mb" else STORE.data["settings"]["max_mb"]
+    if proposed_max and proposed_min > proposed_max:
+        await message.reply("Minimum size cannot exceed maximum size.")
+        return
+    STORE.data["settings"][key] = value
+    STORE.save()
+    await message.reply(f"✅ {key} set to {value} MB.")
+
+
+@APP.on_message(filters.command(["keywords", "blockext"]) & OWNER)
+async def set_list(_: Client, message: Message) -> None:
+    values = command_value(message).replace(",", " ").split()
+    key = "keywords" if message.command[0] == "keywords" else "blocked_extensions"
+    STORE.data["settings"][key] = values
+    STORE.save()
+    await message.reply(f"✅ {key.replace('_', ' ').title()} updated: {', '.join(values) or 'none'}.")
+
+
+@APP.on_message(filters.command("toggle") & OWNER)
+async def toggle_filter(_: Client, message: Message) -> None:
+    kind = command_value(message).lower()
+    key = f"allow_{kind}"
+    if key not in STORE.data["settings"] or not key.startswith("allow_"):
+        await message.reply("Usage: /toggle <text|photo|video|document|audio|voice|animation|sticker|poll>")
+        return
+    STORE.data["settings"][key] = not STORE.data["settings"][key]
+    STORE.save()
+    await message.reply(f"✅ {kind} forwarding is {'enabled' if STORE.data['settings'][key] else 'disabled'}.")
+
+
+@APP.on_message(filters.command("setregex") & OWNER)
+async def set_regex(_: Client, message: Message) -> None:
+    parts = command_value(message).split(maxsplit=1)
+    if parts == ["off"]:
+        STORE.data["settings"]["regex"] = ""
+        STORE.save()
+        await message.reply("✅ Regex filter cleared.")
+        return
+    if len(parts) != 2 or parts[0] not in {"include", "exclude"}:
+        await message.reply("Usage: /setregex <include|exclude> <pattern>. Send /setregex off to clear it.")
+        return
+    try:
+        re.compile(parts[1])
+    except re.error as exc:
+        await message.reply(f"Invalid regex: {exc}")
+        return
+    STORE.data["settings"].update(regex_mode=parts[0], regex=parts[1])
+    STORE.save()
+    await message.reply("✅ Regex filter saved.")
+
+
+@APP.on_message(filters.command("replacements") & OWNER)
+async def replacements(_: Client, message: Message) -> None:
+    rules: list[list[str]] = []
+    for line in command_value(message).splitlines():
+        find, separator, replacement = line.partition("|")
+        if not separator or not find:
+            await message.reply("Usage: /replacements find|replace (one rule per line)")
+            return
+        rules.append([find, replacement])
+    STORE.data["settings"]["replacements"] = rules
+    STORE.save()
+    await message.reply(f"✅ Saved {len(rules)} replacement rule(s).")
+
+
+@APP.on_message(filters.command("reset") & OWNER)
+async def reset(_: Client, message: Message) -> None:
+    from .storage import DEFAULT_DATA
+
+    STORE.data["settings"] = JsonStore._merge(STORE, DEFAULT_DATA["settings"], {})
+    STORE.save()
+    await message.reply("✅ Filters, captions, buttons, and replacement rules reset. Identities and channels were kept.")
+
+
+@APP.on_message(filters.command("ongoing") & OWNER)
+async def ongoing(_: Client, message: Message) -> None:
+    task = BULK_TASKS.get(message.from_user.id) if message.from_user else None
+    await message.reply("⏳ A bulk task is running." if task and not task.done() else "No bulk task is running.")
+
+
+@APP.on_message(filters.command("unequify") & OWNER)
+async def unequify(_: Client, message: Message) -> None:
+    if len(message.command) < 2:
+        await message.reply("Usage: /unequify <chat_id|@username> [message_limit]")
+        return
+    client = await best_client()
+    limit = int(message.command[2]) if len(message.command) > 2 and message.command[2].isdigit() else 1000
+    seen: set[str] = set()
+    removed = 0
+    async for item in client.get_chat_history(parse_chat(message.command[1]), limit=limit):
+        item_fingerprint = fingerprint(item)
+        if item_fingerprint in seen:
+            with suppress(RPCError):
+                await item.delete()
+                removed += 1
+        else:
+            seen.add(item_fingerprint)
+    await message.reply(f"✅ Duplicate scan complete. Removed {removed} duplicate message(s).")
+
+
 async def live_handler(client: Client, message: Message) -> None:
     for job in STORE.data["live_jobs"].values():
         if str(message.chat.id) == str(job["source"]):
@@ -268,7 +462,10 @@ async def liveforward(_: Client, message: Message) -> None:
     if len(message.command) < 3:
         await message.reply("Usage: /liveforward <source_chat_id> <dest_chat_id>")
         return
-    client = await best_client()
+    client = await best_user_client()
+    if client is None:
+        await message.reply("Live forwarding requires an added userbot. Use /adduserbot <Pyrogram v2 session string> first.")
+        return
     key = f"{message.from_user.id}:{message.command[1]}:{message.command[2]}"
     STORE.data["live_jobs"][key] = {"source": str(parse_chat(message.command[1])), "dest": parse_chat(message.command[2])}
     STORE.save()

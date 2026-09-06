@@ -24,6 +24,10 @@ DEFAULT_DATA: dict[str, Any] = {
         "allow_animation": True,
         "allow_sticker": True,
         "allow_poll": True,
+        "skip_duplicates": True,
+        "regex": "",
+        "regex_mode": "include",
+        "replacements": [],
     },
     "duplicates": [],
     "live_jobs": {},
@@ -45,7 +49,9 @@ class JsonStore:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
+        temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        temporary.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(self.path)
 
     def _merge(self, base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
         merged = json.loads(json.dumps(base))
